@@ -1,5 +1,7 @@
 import argparse
 import os
+from datetime import datetime
+from pathlib import Path
 
 if os.name == "nt":
     hadoop_home = os.path.join(
@@ -162,7 +164,10 @@ ENTITY_FEATURE_COLUMNS = [
 
 def parse_run_config():
     """
-    Read the requested pipeline mode from the terminal command.
+    Read the requested static-pipeline mode and optional time cutoff.
+
+    When end_timestamp is supplied, only transactions strictly before that
+    timestamp are included in the static graph baseline.
     """
     parser = argparse.ArgumentParser(
         description="Build MuleDetector static Spark graph outputs."
@@ -175,7 +180,7 @@ def parse_run_config():
         type=int,
         default=SAMPLE_ROW_LIMIT,
         help=(
-            "Run a bounded sample. "
+            "Run a bounded sample after applying any time cutoff. "
             "Default: 100000 rows."
         ),
     )
@@ -183,22 +188,76 @@ def parse_run_config():
     mode.add_argument(
         "--full",
         action="store_true",
-        help="Run the complete historical transaction dataset.",
+        help="Run every transaction that passes any time cutoff.",
+    )
+
+    parser.add_argument(
+        "--end-timestamp",
+        help=(
+            "Exclusive static-baseline cutoff in YYYY/MM/DD HH:MM format. "
+            "Only transactions before this time are included."
+        ),
+    )
+
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help=(
+            "Output directory for this run. Required when "
+            "--end-timestamp is used, so spark_static_full is protected."
+        ),
+    )
+
+    parser.add_argument(
+        "--write-account-events",
+        action="store_true",
+        help=(
+            "Also save the canonical Account-event table. "
+            "Required when this static output will seed streaming."
+        ),
     )
 
     args = parser.parse_args()
 
+    if args.end_timestamp is not None:
+        try:
+            datetime.strptime(
+                args.end_timestamp,
+                "%Y/%m/%d %H:%M",
+            )
+        except ValueError as error:
+            raise ValueError(
+                "--end-timestamp must use YYYY/MM/DD HH:MM format."
+            ) from error
+
+        if args.output_dir is None:
+            raise ValueError(
+                "--output-dir is required with --end-timestamp. "
+                "This prevents overwriting spark_static_full."
+            )
+
     if args.full:
-        return None, (
+        max_rows = None
+        default_output_dir = (
             PROCESSED_DATA_DIR / "spark_static_full"
         )
+    else:
+        if args.max_rows <= 0:
+            raise ValueError("--max-rows must be greater than zero.")
 
-    if args.max_rows <= 0:
-        raise ValueError("--max-rows must be greater than zero.")
+        max_rows = args.max_rows
+        default_output_dir = (
+            PROCESSED_DATA_DIR
+            / f"spark_static_sample_{args.max_rows}"
+        )
 
-    return args.max_rows, (
-        PROCESSED_DATA_DIR
-        / f"spark_static_sample_{args.max_rows}"
+    output_dir = args.output_dir or default_output_dir
+
+    return (
+        max_rows,
+        output_dir,
+        args.end_timestamp,
+        args.write_account_events,
     )
 
 def build_output_paths(output_dir):
@@ -206,6 +265,9 @@ def build_output_paths(output_dir):
     Build all Parquet output paths for one pipeline run.
     """
     return {
+        "account_events": (
+            output_dir / "account_events.parquet"
+        ),
         "account_features": (
             output_dir / "node_account_features.parquet"
         ),
@@ -237,6 +299,7 @@ def create_spark_session() -> SparkSession:
         .master("local[2]")
         .config("spark.driver.memory", "6g")
         .config("spark.executor.memory", "6g")
+        .config("spark.sql.session.timeZone", "UTC")
         .config("spark.sql.adaptive.enabled", "true")
         .config("spark.sql.shuffle.partitions", "8")
         .config("spark.default.parallelism", "2")
@@ -1277,7 +1340,12 @@ def validate_enriched_transactions(enriched_transactions) -> None:
 
 
 def main() -> None:
-    max_rows, output_dir = parse_run_config()
+    (
+        max_rows,
+        output_dir,
+        end_timestamp,
+        write_account_events,
+    ) = parse_run_config()
     output_paths = build_output_paths(output_dir)
 
     spark = create_spark_session()
@@ -1286,6 +1354,30 @@ def main() -> None:
     try:
         print("Reading raw HI-Medium source files with Spark...")
         transactions, accounts = read_source_data(spark)
+        if end_timestamp is not None:
+            print(
+                "\nBuilding static baseline from transactions before "
+                f"{end_timestamp}..."
+            )
+
+            transactions = (
+                transactions
+                .withColumn(
+                    "_cutoff_event_time",
+                    F.to_timestamp(
+                        "Timestamp",
+                        "yyyy/MM/dd HH:mm",
+                    ),
+                )
+                .filter(
+                    F.col("_cutoff_event_time")
+                    < F.to_timestamp(
+                        F.lit(end_timestamp),
+                        "yyyy/MM/dd HH:mm",
+                    )
+                )
+                .drop("_cutoff_event_time")
+            )
 
         if max_rows is None:
             print(
@@ -1317,6 +1409,19 @@ def main() -> None:
 
         print(f"Account events: {account_events.count():,}")
         account_events.show(5, truncate=False)
+
+        if write_account_events:
+            print(
+                "\nWriting canonical baseline Account events to Parquet..."
+            )
+
+            (
+                account_events.write
+                .mode("overwrite")
+                .parquet(str(output_paths["account_events"]))
+            )
+
+            print(f"Saved: {output_paths['account_events']}")
 
         print("\nComputing directional Account features...")
 
