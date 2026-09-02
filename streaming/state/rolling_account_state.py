@@ -16,7 +16,7 @@ from pyspark.sql.types import (
     TimestampType,
 )
 
-from streaming.spark_kafka_consumer import build_spark_session
+from streaming.kafka.spark_kafka_consumer import build_spark_session
 
 
 ACCOUNT_EVENT_SCHEMA = StructType(

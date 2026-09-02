@@ -1070,18 +1070,26 @@ def compute_shared_account_features(account_events):
         F.col("total_event_count") / F.col("unique_counterparties"),
     )
 
-def compute_temporal_account_features(account_events):
+def compute_temporal_account_features(
+    account_events,
+    snapshot_time=None,
+):
     """
     Compute Account temporal and transaction-velocity features.
+
+    When ``snapshot_time`` is supplied, it must be a one-row DataFrame with
+    a ``snapshot_time`` column. This lets incremental updates use the global
+    stream time while calculating features for only affected Accounts.
     """
     account_bounds = account_events.groupBy("account_id").agg(
         F.min("event_time").alias("first_event_time"),
         F.max("event_time").alias("last_event_time"),
     )
 
-    snapshot_time = account_events.agg(
-        F.max("event_time").alias("snapshot_time")
-    )
+    if snapshot_time is None:
+        snapshot_time = account_events.agg(
+            F.max("event_time").alias("snapshot_time")
+        )
 
     activity_span_and_recency = (
         account_bounds
@@ -1200,14 +1208,16 @@ def compute_base_account_to_account_edges(enriched_transactions):
 def finalize_account_to_account_edges(
     base_edges,
     enriched_transactions,
+    snapshot_time=None,
 ):
     """
     Add temporal edge features and keep the final nine edge features
     in the fixed graph/model order.
     """
-    snapshot_time = enriched_transactions.agg(
-        F.max("event_time").alias("snapshot_time")
-    )
+    if snapshot_time is None:
+        snapshot_time = enriched_transactions.agg(
+            F.max("event_time").alias("snapshot_time")
+        )
 
     edges_with_recency = (
         base_edges

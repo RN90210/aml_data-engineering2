@@ -44,6 +44,21 @@ def rebuild_transaction_rows(account_events):
     )
 
 
+def build_account_edges(
+    account_events,
+    snapshot_time=None,
+):
+    """Build the exact nine Account-to-Account edge features."""
+    transactions = rebuild_transaction_rows(account_events)
+    base_edges = compute_base_account_to_account_edges(transactions)
+
+    return finalize_account_to_account_edges(
+        base_edges,
+        transactions,
+        snapshot_time=snapshot_time,
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -76,13 +91,7 @@ def main() -> None:
     spark.sparkContext.setLogLevel("WARN")
 
     account_events = spark.read.parquet(str(args.input_dir))
-    transactions = rebuild_transaction_rows(account_events)
-
-    base_edges = compute_base_account_to_account_edges(transactions)
-    account_edges = finalize_account_to_account_edges(
-        base_edges,
-        transactions,
-    )
+    account_edges = build_account_edges(account_events)
 
     (
         account_edges

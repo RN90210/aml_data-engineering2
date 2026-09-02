@@ -22,7 +22,10 @@ def create_spark_session() -> SparkSession:
     )
 
 
-def build_account_features(account_events):
+def build_account_features(
+    account_events,
+    snapshot_time=None,
+):
     """
     Reuse the exact static feature formulas over the streamed account-event log.
 
@@ -34,7 +37,10 @@ def build_account_features(account_events):
         account_events
     )
     shared_features = compute_shared_account_features(account_events)
-    temporal_features = compute_temporal_account_features(account_events)
+    temporal_features = compute_temporal_account_features(
+        account_events,
+        snapshot_time=snapshot_time,
+    )
 
     feature_stage = (
         all_accounts

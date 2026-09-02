@@ -44,6 +44,9 @@ def build_spark_session() -> SparkSession:
         SparkSession.builder
         .appName("MuleDetectorKafkaStreaming")
         .config("spark.sql.session.timeZone", "UTC")
+        .config("spark.sql.autoBroadcastJoinThreshold", "-1")
+        .config("spark.sql.shuffle.partitions", "8")
+        .config("spark.default.parallelism", "8")
         .config("spark.jars.packages", KAFKA_CONNECTOR_PACKAGE)
         .getOrCreate()
     )

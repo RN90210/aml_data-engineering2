@@ -21,11 +21,67 @@ def create_spark_session() -> SparkSession:
     )
 
 
-def build_bank_features(
-    account_events: DataFrame,
+def spark_read_parquet(path: Path) -> DataFrame:
+    """Read a Parquet table through the active Spark session."""
+    return SparkSession.getActiveSession().read.parquet(str(path))
+
+
+def load_bank_account_counts(
     static_output_dir: Path,
 ) -> DataFrame:
+    """
+    Load stable Bank metadata.
+
+    This is safe to cache for an entire streaming run because the number of
+    accounts registered at each Bank does not change during the replay.
+    """
+    return (
+        spark_read_parquet(
+            static_output_dir / "node_bank_features.parquet"
+        )
+        .select("bank_id", "bank_account_count")
+    )
+
+
+def load_entity_types(
+    static_output_dir: Path,
+) -> DataFrame:
+    """
+    Load stable Entity-type metadata.
+
+    These one-hot Entity type columns are fixed metadata, not transaction
+    behaviour, so they can be reused by every micro-batch.
+    """
+    entity_type_columns = [
+        column_name
+        for column_name in ENTITY_FEATURE_COLUMNS
+        if column_name.startswith("entity_type_")
+    ]
+
+    return (
+        spark_read_parquet(
+            static_output_dir / "node_entity_features.parquet"
+        )
+        .select("entity_id", *entity_type_columns)
+    )
+
+
+def build_bank_features(
+    account_events: DataFrame,
+    static_output_dir: Path | None = None,
+    bank_account_counts: DataFrame | None = None,
+) -> DataFrame:
     """Build exact Bank features for Banks affected by streamed events."""
+    if bank_account_counts is None:
+        if static_output_dir is None:
+            raise ValueError(
+                "Provide static_output_dir or bank_account_counts."
+            )
+
+        bank_account_counts = load_bank_account_counts(
+            static_output_dir
+        )
+
     bank_events = account_events.select(
         "bank_id",
         "counterparty_bank_id",
@@ -37,13 +93,6 @@ def build_bank_features(
         "is_cross_bank",
         "is_odd_hour",
         "is_weekend",
-    )
-
-    bank_account_counts = (
-        spark_read_parquet(
-            static_output_dir / "node_bank_features.parquet"
-        )
-        .select("bank_id", "bank_account_count")
     )
 
     active_banks = bank_events.select("bank_id").distinct()
@@ -101,9 +150,18 @@ def build_bank_features(
 
 def build_entity_features(
     account_events: DataFrame,
-    static_output_dir: Path,
+    static_output_dir: Path | None = None,
+    entity_types: DataFrame | None = None,
 ) -> DataFrame:
     """Build exact Entity features for Entities affected by streamed events."""
+    if entity_types is None:
+        if static_output_dir is None:
+            raise ValueError(
+                "Provide static_output_dir or entity_types."
+            )
+
+        entity_types = load_entity_types(static_output_dir)
+
     entity_events = account_events.select(
         "entity_id",
         "bank_id",
@@ -114,19 +172,6 @@ def build_entity_features(
         "payment_format",
         "is_cross_bank",
         "is_odd_hour",
-    )
-
-    entity_type_columns = [
-        column_name
-        for column_name in ENTITY_FEATURE_COLUMNS
-        if column_name.startswith("entity_type_")
-    ]
-
-    entity_types = (
-        spark_read_parquet(
-            static_output_dir / "node_entity_features.parquet"
-        )
-        .select("entity_id", *entity_type_columns)
     )
 
     active_entities = entity_events.select("entity_id").distinct()
@@ -178,11 +223,6 @@ def build_entity_features(
     )
 
 
-def spark_read_parquet(path: Path) -> DataFrame:
-    """Read a static Spark output through the active Spark session."""
-    return SparkSession.getActiveSession().read.parquet(str(path))
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -221,6 +261,12 @@ def main() -> None:
             f"Streaming account events not found: {args.input_dir}"
         )
 
+    if not args.static_output_dir.exists():
+        raise FileNotFoundError(
+            "Static metadata directory not found: "
+            f"{args.static_output_dir}"
+        )
+
     spark = create_spark_session()
     spark.sparkContext.setLogLevel("WARN")
 
@@ -228,11 +274,11 @@ def main() -> None:
 
     bank_features = build_bank_features(
         account_events,
-        args.static_output_dir,
+        static_output_dir=args.static_output_dir,
     )
     entity_features = build_entity_features(
         account_events,
-        args.static_output_dir,
+        static_output_dir=args.static_output_dir,
     )
 
     bank_features.write.mode("overwrite").parquet(
