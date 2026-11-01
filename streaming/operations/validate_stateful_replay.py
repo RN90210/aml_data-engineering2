@@ -13,6 +13,7 @@ if sys.platform == "win32":
     os.environ["PYSPARK_PYTHON"] = sys.executable
     os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
 
+from pyspark import StorageLevel
 from pyspark.sql import DataFrame, SparkSession, functions as F
 from pyspark.sql.types import LongType, StructField, StructType
 
@@ -326,6 +327,8 @@ def validate_replay(args: argparse.Namespace) -> bool:
             entity_lookup,
             args.run_id,
         )
+        valid_events = valid_events.persist(StorageLevel.MEMORY_AND_DISK)
+        valid_events.count()
 
         maximum_offset_row = replay_offsets.agg(
             F.max("kafka_offset").alias("maximum_offset")
@@ -362,6 +365,7 @@ def validate_replay(args: argparse.Namespace) -> bool:
                     / f"batch_id={batch_id}"
                     / f"{table_name}.parquet"
                 )
+                expected = expected.persist(StorageLevel.MEMORY_AND_DISK)
                 try:
                     actual = spark.read.parquet(str(table_path))
                     passed, reason = compare_table(
@@ -372,6 +376,8 @@ def validate_replay(args: argparse.Namespace) -> bool:
                 except Exception as error:
                     passed = False
                     reason = str(error).splitlines()[0]
+                finally:
+                    expected.unpersist()
 
                 if passed:
                     print(f"batch={batch_id} table={table_name} PASS")
@@ -381,6 +387,8 @@ def validate_replay(args: argparse.Namespace) -> bool:
                         f"batch={batch_id} table={table_name} FAIL: {reason}"
                     )
     finally:
+        if "valid_events" in locals():
+            valid_events.unpersist()
         spark.stop()
 
     print(f"overall={'PASS' if overall_passed else 'FAIL'}")
