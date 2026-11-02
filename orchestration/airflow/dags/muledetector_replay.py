@@ -1,16 +1,12 @@
 """
-MuleDetector's first Airflow-orchestrated Kafka replay.
+MuleDetector's bounded Airflow-orchestrated Kafka replay.
 
-This DAG deliberately runs one task at a time:
-
-prepare replay CSV
-→ publish to Kafka
-→ create native stateful Account, edge, Bank, and Entity updates
-→ create Account relations
-→ independently audit the Kafka replay
-→ package the model-update manifests
-→ validate the replay output
-→ write a final run report
+Prepare and publish a replay, then choose a shared Spark application or the
+legacy standalone output jobs. The shared application audits and packages each
+batch during processing; the legacy branch audits/packages after its bounded
+concurrent jobs finish. Independent recomputation is enabled for acceptance runs
+and can be disabled explicitly for normal delivery. Both paths write a final
+run report after all input is processed.
 
 Each Airflow run uses a unique Kafka topic, replay file, and Spark
 checkpoint directories. This prevents one manual replay from consuming
@@ -47,6 +43,18 @@ REPLAY_ROW_COUNT = 1000
 MAX_OFFSETS_PER_TRIGGER = 500
 
 
+def replay_task_limit() -> int:
+    """Bound simultaneous Spark applications; set at DAG-parse time, not per run."""
+    value = os.environ.get("MULEDETECTOR_MAX_ACTIVE_TASKS", "2")
+    try:
+        limit = int(value)
+    except ValueError as error:
+        raise ValueError("MULEDETECTOR_MAX_ACTIVE_TASKS must be an integer from 1 to 5.") from error
+    if not 1 <= limit <= 5:
+        raise ValueError("MULEDETECTOR_MAX_ACTIVE_TASKS must be an integer from 1 to 5.")
+    return limit
+
+
 def run_project_command(task_name: str, command: list[str]) -> None:
     """Run one project command and send its output to the Airflow task log."""
     if not PROJECT_ROOT.is_dir():
@@ -75,6 +83,7 @@ def run_project_command(task_name: str, command: list[str]) -> None:
     schedule=None,
     catchup=False,
     max_active_runs=1,
+    max_active_tasks=replay_task_limit(),
     default_args={
         "owner": "Ruhan",
         "retries": 0,
@@ -99,12 +108,24 @@ def muledetector_replay():
         max_offsets = int(settings.get("max_offsets_per_trigger", MAX_OFFSETS_PER_TRIGGER))
         if replay_row_count <= 0 or max_offsets <= 0:
             raise ValueError("Replay row count and max offsets must be positive.")
+        pipeline_mode = settings.get("pipeline_mode", "shared")
+        if pipeline_mode not in {"shared", "legacy"}:
+            raise ValueError("pipeline_mode must be shared or legacy.")
+        feature_jobs = int(settings.get("concurrent_feature_jobs", 2))
+        if not 1 <= feature_jobs <= 5:
+            raise ValueError("concurrent_feature_jobs must be from 1 to 5.")
+        verify_features = settings.get("verify_features", True)
+        if not isinstance(verify_features, bool):
+            raise ValueError("verify_features must be a JSON boolean.")
 
         streaming_root = PROJECT_ROOT / "data/streaming"
         checkpoint_root = PROJECT_ROOT / "data/checkpoints/airflow"
 
         return {
             "run_id": run_id,
+            "pipeline_mode": pipeline_mode,
+            "concurrent_feature_jobs": str(feature_jobs),
+            "verify_features": "true" if verify_features else "false",
             "replay_row_count": str(replay_row_count),
             "max_offsets_per_trigger": str(max_offsets),
             "topic": f"aml-transactions-{run_timestamp}",
@@ -236,6 +257,31 @@ def muledetector_replay():
             "account_features",
         )
 
+    @task.branch
+    def choose_pipeline(config: dict[str, str]) -> list[str]:
+        """Keep the verified standalone path available for comparison/recovery."""
+        if config["pipeline_mode"] == "shared":
+            return ["process_shared_updates"]
+        return ["process_account_features", "process_account_edges", "process_bank_features",
+                "process_entity_features", "process_account_relations"]
+
+    @task
+    def process_shared_updates(config: dict[str, str]) -> None:
+        """One application prepares once and publishes each completed batch."""
+        run_project_command("process_shared_updates", [
+            "python", "-m", "streaming.ingestion.shared_stateful_streaming_pipeline",
+            "--topic", config["topic"], "--bootstrap-servers", "kafka:9092",
+            "--max-offsets-per-trigger", config["max_offsets_per_trigger"],
+            "--run-id", config["run_id"],
+            "--account-entity-lookup-path", str(ACCOUNT_ENTITY_LOOKUP_PATH),
+            "--static-metadata-dir", str(STATIC_OUTPUT_DIR),
+            "--output-dir", config["model_updates_dir"],
+            "--rejected-output-dir", config["audit_rejected_dir"],
+            "--metrics-output-dir", config["audit_metrics_dir"],
+            "--checkpoint-dir", str(Path(config["checkpoint_root"]) / "shared"),
+            "--concurrent-feature-jobs", config["concurrent_feature_jobs"],
+        ])
+
     @task
     def process_account_edges(config: dict[str, str]) -> None:
         run_native_pipeline(
@@ -314,6 +360,11 @@ def muledetector_replay():
             ],
         )
 
+    @task.branch(trigger_rule="none_failed_min_one_success")
+    def choose_verification(config: dict[str, str]) -> str:
+        """Retain recomputation for acceptance; normal delivery can omit it."""
+        return "validate_replay" if config["verify_features"] == "true" else "write_run_report"
+
     @task
     def validate_replay(config: dict[str, str]) -> None:
         """Rebuild expected values from the replay CSV and compare outputs."""
@@ -338,7 +389,7 @@ def muledetector_replay():
             ],
         )
 
-    @task
+    @task(trigger_rule="none_failed_min_one_success")
     def write_run_report(config: dict[str, str]) -> None:
         """Write one final JSON report only when the replay has no rejections."""
         run_project_command(
@@ -363,6 +414,8 @@ def muledetector_replay():
 
     prepared = prepare_replay_window(config)
     published = publish_replay_to_kafka(config)
+    chosen = choose_pipeline(config)
+    shared = process_shared_updates(config)
     accounts = process_account_features(config)
     edges = process_account_edges(config)
     banks = process_bank_features(config)
@@ -370,11 +423,19 @@ def muledetector_replay():
     relations = process_account_relations(config)
     audited = audit_replay(config)
     packaged = package_model_updates(config)
+    verification = choose_verification(config)
     validated = validate_replay(config)
     reported = write_run_report(config)
 
-    prepared >> published >> accounts >> edges >> banks >> entities
-    entities >> relations >> audited >> packaged >> validated >> reported
+    # Each branch consumes the same bounded topic with its own checkpoint and
+    # writes separate tables. The barrier prevents packaging partial output.
+    output_jobs = [accounts, edges, banks, entities, relations]
+    prepared >> published >> chosen >> output_jobs
+    chosen >> shared >> verification
+    for output_job in output_jobs:
+        output_job >> audited
+    audited >> packaged >> verification >> validated >> reported
+    verification >> reported
 
 
 muledetector_replay()

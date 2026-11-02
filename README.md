@@ -54,6 +54,9 @@ The final demonstration uses a fixed event-time cutoff:
 * An Airflow run can reuse an existing prepared replay CSV through `dag_run.conf.prepared_replay_path`; otherwise it scans the raw CSV to prepare a new window.
 * Replay preparation uses a single CSV scan and retains only the requested earliest rows in memory. It does not start Spark. OneDrive source files must be downloaded locally first.
 * Airflow run configuration can set `replay_row_count` and `max_offsets_per_trigger` (defaults: 1,000 and 500). A prepared CSV must contain exactly `replay_row_count` data rows.
+* Shared processing is the default: one Spark application prepares each Kafka batch once, runs the native processors, and publishes a ready six-table manifest before preparing the next batch. `concurrent_feature_jobs` defaults to 2 simultaneous output actions. See [SHARED_PIPELINE.md](SHARED_PIPELINE.md) for the model feed and checkpoint requirements.
+* Set `pipeline_mode: legacy` to retain the five standalone feature/mapping jobs. Their Airflow task limit defaults to 2; `MULEDETECTOR_MAX_ACTIVE_TASKS` accepts 1 through 5 in the Airflow environment. This is separate from the shared application's action limit.
+* Independent feature comparison is enabled by default for acceptance testing. Set `verify_features: false` for normal delivery runs to omit recomputation while retaining audit, per-batch packaging, and the final report. Ready packages can be consumed before the report is written.
 
 On Windows, set the local Hadoop utilities for each new PowerShell terminal:
 
@@ -89,10 +92,12 @@ See `FEATURE_DESIGN.md` for the fixed feature definitions and ordering contract.
 - `streaming/operations/prepare_replay_window.py` creates the ordered replay CSV.
 - `streaming/kafka/kafka_producer.py` publishes transactions to Kafka.
 - `streaming/ingestion/stateful_*_streaming_pipeline.py` writes native Account, edge, Bank, and Entity updates.
+- `streaming/ingestion/shared_stateful_streaming_pipeline.py` shares ingestion and fixed lookups in one application and publishes complete packages per batch; see [SHARED_PIPELINE.md](SHARED_PIPELINE.md).
+- `streaming/operations/model_update_feed.py` exposes ordered, audited ready packages to a model-owned consumer without waiting for the final run report.
 - `streaming/ingestion/account_relation_streaming_pipeline.py` writes the two mapping tables.
 - `streaming/ingestion/streaming_audit_pipeline.py` audits the same Kafka replay independently.
 - `streaming/operations/package_incremental_model_updates.py`, `validate_stateful_replay.py`, and `write_stateful_run_report.py` validate and report completed batches.
-- `orchestration/airflow/dags/muledetector_replay.py` runs the replay stages in order.
+- `orchestration/airflow/dags/muledetector_replay.py` prepares/publishes the replay, selects shared processing by default, optionally verifies features, and writes the final report. The legacy standalone branch remains available.
 
 ## Data policy
 
@@ -103,3 +108,8 @@ Raw CSV files, generated Parquet outputs, Kafka/Spark checkpoints, and PyTorch a
 `streaming.operations.verify_stateful_recovery` is an opt-in integration check for a running Kafka/Spark environment. Use a fresh topic, run ID, checkpoint root, output namespace, and report path with the two-row `stateful_carry_test_2.csv` fixture. It executes one Spark job at a time for Accounts, edges, Banks, Entities, and mappings. For each component it fails batch 1 after the Parquet write but before Spark's commit, verifies batch 0 was committed, restarts with the same checkpoint, and verifies a further restart with no new messages leaves Parquet bytes unchanged. It then compares both recovered batches against the existing incremental feature builders. Logs and a JSON report are retained; checkpoints are never removed by this utility.
 
 The local recovery run `laptop_recovery_20261101` passed for all five components. The larger Airflow run `airflow_replay_20261101T075252` also passed: 5,000 transactions in ten batches, zero rejected events, ten ready model packages, and all sixty independent table comparisons passed. The full 3 GB local CSV preparation took 308.99 seconds with the bounded scanner. See [MODEL_HANDOFF.md](MODEL_HANDOFF.md) for evidence paths and the model interface.
+
+The November 2 processor refactor preserves the feature/state contracts and
+reuses fixed lookup computation across batches. Its 5,000-transaction acceptance
+run passed all sixty comparisons. See [PERFORMANCE.md](PERFORMANCE.md) for the
+measured callback and Spark timings, startup tradeoffs, and test commands.

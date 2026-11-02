@@ -224,19 +224,39 @@ def build_account_events(transactions: DataFrame) -> DataFrame:
 def load_entity_lookup(
     spark: SparkSession,
     account_entity_lookup_path: Path,
+    cache_lookup: bool = True,
 ) -> DataFrame:
-    """Load stable Account-to-Entity metadata for streaming enrichment."""
+    """Load and materialize fixed metadata once, not once per micro-batch.
+
+    Only this static lookup is persisted. Callers own its lifetime and should
+    unpersist it when their query ends. The opt-out supports controlled replay
+    benchmarks of the former uncached implementation.
+    """
     if not account_entity_lookup_path.exists():
         raise FileNotFoundError(
             "Account metadata lookup not found: "
             f"{account_entity_lookup_path}"
         )
 
-    return (
+    lookup = (
         spark.read.parquet(str(account_entity_lookup_path))
         .select("account_id", "entity_id")
-        .dropDuplicates(["account_id"])
     )
+    if cache_lookup:
+        # An explicit partition count prevents AQE from coalescing cached metadata
+        # differently from the streaming joins. Keep the fixed join side sorted
+        # so each micro-batch does not sort the full lookup again.
+        partitions = int(spark.conf.get("spark.sql.shuffle.partitions", "8"))
+        lookup = lookup.repartition(partitions, "account_id")
+    lookup = lookup.dropDuplicates(["account_id"])
+    if cache_lookup:
+        lookup = lookup.sortWithinPartitions("account_id").persist(StorageLevel.MEMORY_AND_DISK)
+        try:
+            lookup.count()
+        except Exception:
+            lookup.unpersist()
+            raise
+    return lookup
 
 
 def split_valid_and_rejected_events(
@@ -738,6 +758,7 @@ def main() -> None:
     finally:
         bank_account_counts.unpersist()
         entity_types.unpersist()
+        entity_lookup.unpersist()
 
 
 if __name__ == "__main__":

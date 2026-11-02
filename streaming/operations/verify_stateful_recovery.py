@@ -15,6 +15,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+import types
 
 
 COMPONENTS = {
@@ -29,6 +30,17 @@ COMPONENTS = {
 def fail_worker() -> None:
     """Write batch 1 normally, then fail before Spark can commit that batch."""
     component, marker = sys.argv[2:4]
+    pipeline_options = sys.argv[4:]
+    if pipeline_options[:1] == ["--baseline-bundle"]:
+        bundle = json.loads(Path(pipeline_options[1]).read_text(encoding="utf-8"))
+        pipeline_options = pipeline_options[2:]
+        if component in bundle["sources"]:
+            name = f"streaming.state.stateful_{component}_processor"
+            baseline = types.ModuleType(name)
+            exec(compile(bundle["sources"][component], name, "exec"), baseline.__dict__)
+            sys.modules[name] = baseline
+            from pyspark import cloudpickle
+            cloudpickle.register_pickle_by_value(baseline)
     module_name, writer_name = COMPONENTS[component]
     module = importlib.import_module(f"streaming.ingestion.{module_name}")
     original = getattr(module, writer_name)
@@ -41,7 +53,7 @@ def fail_worker() -> None:
             raise RuntimeError("INTENTIONAL_RECOVERY_TEST_FAILURE_AFTER_WRITE")
 
     setattr(module, writer_name, write_then_fail)
-    sys.argv = [module_name, *sys.argv[4:]]
+    sys.argv = [module_name, *pipeline_options]
     module.main()
 
 
@@ -64,6 +76,8 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--checkpoint-root", type=Path, required=True)
     parser.add_argument("--report-path", type=Path, required=True)
+    parser.add_argument("--baseline-bundle", type=Path,
+                        help="Use old processors for the failure phase, then resume with current code.")
     args = parser.parse_args()
     run_dir = args.output_dir / f"run_id={args.run_id}"
     if run_dir.exists() or args.checkpoint_root.exists() or args.report_path.exists():
@@ -74,6 +88,11 @@ def main() -> None:
     environment["PYTHONUNBUFFERED"] = "1"
     report = {"kind": "stateful_checkpoint_recovery_verification", "run_id": args.run_id,
               "status": "running", "components": {}, "feature_comparison": "pending"}
+    if args.baseline_bundle is not None:
+        report["failure_worker_baseline_commit"] = json.loads(
+            args.baseline_bundle.read_text(encoding="utf-8")
+        )["baseline_commit"]
+        report["resume_worker_version"] = "current_working_tree"
     started = time.perf_counter()
 
     def run(label, command):
@@ -97,9 +116,12 @@ def main() -> None:
                 "--output-dir", str(args.output_dir), "--checkpoint-dir", str(checkpoint)]
             if component in {"bank", "entity"}:
                 options += ["--static-metadata-dir", str(args.static_output_dir)]
-            failed_code = run(f"{component}_injected_failure", [sys.executable, "-m",
+            failure_command = [sys.executable, "-m",
                 "streaming.operations.verify_stateful_recovery", "_worker", component,
-                str(marker), *options])
+                str(marker)]
+            if args.baseline_bundle is not None:
+                failure_command += ["--baseline-bundle", str(args.baseline_bundle)]
+            failed_code = run(f"{component}_injected_failure", [*failure_command, *options])
             if not failed_code or not marker.exists():
                 raise RuntimeError(f"{component}: expected after-write failure was not observed")
             if not (checkpoint / "commits/0").exists() or (checkpoint / "commits/1").exists():

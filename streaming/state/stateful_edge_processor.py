@@ -20,6 +20,14 @@ from pyspark.sql.types import (
     TimestampType,
 )
 
+from streaming.state._processor_batch import (
+    combine_event_frames,
+    consecutive_gap_delta,
+    event_time_bounds,
+    ordered_amounts,
+    sum_numeric_column,
+)
+
 from preprocessing.spark_static_pipeline import (
     ACCOUNT_TO_ACCOUNT_EDGE_FEATURE_COLUMNS,
 )
@@ -125,14 +133,9 @@ class EdgeRunningTotalsProcessor(StatefulProcessor):
     ) -> Iterator[pd.DataFrame]:
         del timer_values
 
-        batch_frames = list(rows)
-        if not batch_frames:
+        events = combine_event_frames(rows)
+        if events is None:
             return
-
-        events = pd.concat(
-            batch_frames,
-            ignore_index=True,
-        ).sort_values("event_time", kind="stable")
 
         if self.running_state.exists():
             previous_state = self.running_state.get()
@@ -158,8 +161,7 @@ class EdgeRunningTotalsProcessor(StatefulProcessor):
             inter_txn_gap_hours_sum = 0.0
             inter_txn_gap_count = 0
 
-        batch_first_event_time = events["event_time"].min()
-        batch_last_event_time = events["event_time"].max()
+        batch_first_event_time, batch_last_event_time = event_time_bounds(events)
         if (
             last_ordered_event_time is not None
             and batch_first_event_time < last_ordered_event_time
@@ -169,36 +171,24 @@ class EdgeRunningTotalsProcessor(StatefulProcessor):
                 "event-time input."
             )
 
-        amounts = pd.to_numeric(
-            events["amount"],
-            errors="coerce",
-        ).fillna(0.0)
+        amounts, _ = ordered_amounts(events, ["event_time"])
         edge_txn_count += len(events)
         edge_total_paid += float(amounts.sum())
         edge_amount_sum_squares += float((amounts * amounts).sum())
-        currency_switch_sum += float(
-            pd.to_numeric(
-                events["is_currency_switch"],
-                errors="coerce",
-            )
-            .fillna(0.0)
-            .sum()
-        )
+        currency_switch_sum += sum_numeric_column(events, "is_currency_switch")
         payment_formats.update(
             str(value)
             for value in events["payment_format"].dropna().tolist()
             if str(value) != ""
         )
 
-        for event_time in events["event_time"].tolist():
-            event_timestamp = pd.Timestamp(event_time)
-            if last_ordered_event_time is not None:
-                inter_txn_gap_hours_sum += (
-                    event_timestamp
-                    - pd.Timestamp(last_ordered_event_time)
-                ).total_seconds() / 3600.0
-                inter_txn_gap_count += 1
-            last_ordered_event_time = event_timestamp
+        gap_sum, gap_count = consecutive_gap_delta(
+            batch_first_event_time, batch_last_event_time,
+            len(events), last_ordered_event_time,
+        )
+        inter_txn_gap_hours_sum += gap_sum
+        inter_txn_gap_count += gap_count
+        last_ordered_event_time = batch_last_event_time
 
         if (
             first_event_time is None

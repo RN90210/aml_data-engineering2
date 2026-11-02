@@ -155,10 +155,12 @@ def package_batch(
     }
 
     manifest_path = batch_directory / "manifest.json"
-    manifest_path.write_text(
+    temporary_manifest_path = manifest_path.with_suffix(".json.tmp")
+    temporary_manifest_path.write_text(
         json.dumps(manifest, indent=2) + "\n",
         encoding="utf-8",
     )
+    temporary_manifest_path.replace(manifest_path)
 
     print(
         f"Packaged run_id={run_id}, batch_id={batch_id}: "

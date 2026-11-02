@@ -175,26 +175,29 @@ def main() -> None:
         valid_account_events
     )
 
-    query = (
-        account_feature_updates.writeStream
-        .outputMode("update")
-        .foreachBatch(
-            lambda batch_updates, batch_id: write_account_feature_batch(
-                account_feature_updates=batch_updates,
-                batch_id=batch_id,
-                run_id=args.run_id,
-                output_dir=args.output_dir,
+    try:
+        query = (
+            account_feature_updates.writeStream
+            .outputMode("update")
+            .foreachBatch(
+                lambda batch_updates, batch_id: write_account_feature_batch(
+                    account_feature_updates=batch_updates,
+                    batch_id=batch_id,
+                    run_id=args.run_id,
+                    output_dir=args.output_dir,
+                )
             )
+            .option(
+                "checkpointLocation",
+                str(args.checkpoint_dir),
+            )
+            .trigger(availableNow=True)
+            .start()
         )
-        .option(
-            "checkpointLocation",
-            str(args.checkpoint_dir),
-        )
-        .trigger(availableNow=True)
-        .start()
-    )
 
-    query.awaitTermination()
+        query.awaitTermination()
+    finally:
+        entity_lookup.unpersist()
 
     run_output_dir = args.output_dir / f"run_id={args.run_id}"
     output_count = len(

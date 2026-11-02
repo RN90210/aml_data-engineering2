@@ -19,6 +19,13 @@ from pyspark.sql.types import (
     TimestampType,
 )
 
+from streaming.state._processor_batch import (
+    combine_event_frames,
+    directional_amounts,
+    event_time_bounds,
+    sum_numeric_column,
+)
+
 from preprocessing.spark_static_pipeline import BANK_FEATURE_COLUMNS
 
 
@@ -132,11 +139,7 @@ def string_values(
 
 def numeric_sum(events: pd.DataFrame, column_name: str) -> float:
     """Return a null-safe numeric sum for one event flag."""
-    return float(
-        pd.to_numeric(events[column_name], errors="coerce")
-        .fillna(0.0)
-        .sum()
-    )
+    return sum_numeric_column(events, column_name)
 
 
 def unpack_bank_key(key) -> int:
@@ -168,17 +171,9 @@ class BankRunningTotalsProcessor(StatefulProcessor):
         """Update one Bank from chronologically ordered event rows."""
         del timer_values
 
-        batch_frames = list(rows)
-        if not batch_frames:
+        events = combine_event_frames(rows)
+        if events is None:
             return
-
-        events = pd.concat(
-            batch_frames,
-            ignore_index=True,
-        ).sort_values(
-            ["event_time", "direction", "participant_account_id"],
-            kind="stable",
-        )
 
         if self.running_state.exists():
             previous_state = self.running_state.get()
@@ -210,7 +205,7 @@ class BankRunningTotalsProcessor(StatefulProcessor):
             weekend_sum = 0.0
             last_ordered_event_time = None
 
-        batch_first_event_time = events["event_time"].min()
+        batch_first_event_time, batch_last_event_time = event_time_bounds(events)
         if (
             last_ordered_event_time is not None
             and batch_first_event_time < last_ordered_event_time
@@ -227,14 +222,9 @@ class BankRunningTotalsProcessor(StatefulProcessor):
             events["direction"] == "incoming"
         ]
 
-        outgoing_amounts = pd.to_numeric(
-            outgoing_events["amount"],
-            errors="coerce",
-        ).fillna(0.0)
-        incoming_amounts = pd.to_numeric(
-            incoming_events["amount"],
-            errors="coerce",
-        ).fillna(0.0)
+        outgoing_amounts, incoming_amounts = directional_amounts(
+            events, ["event_time","direction","participant_account_id"],
+        )
 
         outgoing_txn_count += len(outgoing_events)
         incoming_txn_count += len(incoming_events)
@@ -259,7 +249,7 @@ class BankRunningTotalsProcessor(StatefulProcessor):
         cross_bank_sum += numeric_sum(events, "is_cross_bank")
         odd_hour_sum += numeric_sum(events, "is_odd_hour")
         weekend_sum += numeric_sum(events, "is_weekend")
-        last_ordered_event_time = events["event_time"].max()
+        last_ordered_event_time = batch_last_event_time
 
         self.running_state.update(
             (

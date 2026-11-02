@@ -205,26 +205,29 @@ def main() -> None:
         account_events
     )
 
-    query = (
-        valid_account_events.writeStream
-        .outputMode("append")
-        .foreachBatch(
-            lambda batch_events, batch_id: write_account_relation_batch(
-                valid_account_events=batch_events,
-                batch_id=batch_id,
-                output_dir=args.output_dir,
-                run_id=args.run_id,
+    try:
+        query = (
+            valid_account_events.writeStream
+            .outputMode("append")
+            .foreachBatch(
+                lambda batch_events, batch_id: write_account_relation_batch(
+                    valid_account_events=batch_events,
+                    batch_id=batch_id,
+                    output_dir=args.output_dir,
+                    run_id=args.run_id,
+                )
             )
+            .option(
+                "checkpointLocation",
+                str(args.checkpoint_dir),
+            )
+            .trigger(availableNow=True)
+            .start()
         )
-        .option(
-            "checkpointLocation",
-            str(args.checkpoint_dir),
-        )
-        .trigger(availableNow=True)
-        .start()
-    )
 
-    query.awaitTermination()
+        query.awaitTermination()
+    finally:
+        entity_lookup.unpersist()
 
     print("Account relation update run complete.")
     print(f"Output directory: {args.output_dir / f'run_id={args.run_id}'}")

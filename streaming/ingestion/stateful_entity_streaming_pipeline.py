@@ -198,6 +198,7 @@ def main() -> None:
         query.awaitTermination()
     finally:
         cached_entity_types.unpersist()
+        entity_lookup.unpersist()
 
     print("Stateful Entity feature run complete.")
     print(f"Output directory: {args.output_dir / f'run_id={args.run_id}'}")

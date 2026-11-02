@@ -19,6 +19,13 @@ from pyspark.sql.types import (
     TimestampType,
 )
 
+from streaming.state._processor_batch import (
+    combine_event_frames,
+    directional_amounts,
+    event_time_bounds,
+    sum_numeric_column,
+)
+
 from preprocessing.spark_static_pipeline import ENTITY_FEATURE_COLUMNS
 
 
@@ -117,11 +124,7 @@ def string_values(
 
 def numeric_sum(events: pd.DataFrame, column_name: str) -> float:
     """Return a null-safe numeric sum for one event flag."""
-    return float(
-        pd.to_numeric(events[column_name], errors="coerce")
-        .fillna(0.0)
-        .sum()
-    )
+    return sum_numeric_column(events, column_name)
 
 
 def unpack_entity_key(key) -> str:
@@ -153,17 +156,9 @@ class EntityRunningTotalsProcessor(StatefulProcessor):
         """Update one Entity from chronologically ordered event rows."""
         del timer_values
 
-        batch_frames = list(rows)
-        if not batch_frames:
+        events = combine_event_frames(rows)
+        if events is None:
             return
-
-        events = pd.concat(
-            batch_frames,
-            ignore_index=True,
-        ).sort_values(
-            ["event_time", "direction", "account_id"],
-            kind="stable",
-        )
 
         if self.running_state.exists():
             previous_state = self.running_state.get()
@@ -191,7 +186,7 @@ class EntityRunningTotalsProcessor(StatefulProcessor):
             payment_formats = set()
             last_ordered_event_time = None
 
-        batch_first_event_time = events["event_time"].min()
+        batch_first_event_time, batch_last_event_time = event_time_bounds(events)
         if (
             last_ordered_event_time is not None
             and batch_first_event_time < last_ordered_event_time
@@ -207,14 +202,9 @@ class EntityRunningTotalsProcessor(StatefulProcessor):
         incoming_events = events[
             events["direction"] == "incoming"
         ]
-        outgoing_amounts = pd.to_numeric(
-            outgoing_events["amount"],
-            errors="coerce",
-        ).fillna(0.0)
-        incoming_amounts = pd.to_numeric(
-            incoming_events["amount"],
-            errors="coerce",
-        ).fillna(0.0)
+        outgoing_amounts, incoming_amounts = directional_amounts(
+            events, ["event_time","direction","account_id"],
+        )
 
         owned_account_ids.update(string_values(events, "account_id"))
         connected_bank_ids.update(
@@ -233,7 +223,7 @@ class EntityRunningTotalsProcessor(StatefulProcessor):
         payment_formats.update(
             string_values(events, "payment_format")
         )
-        last_ordered_event_time = events["event_time"].max()
+        last_ordered_event_time = batch_last_event_time
 
         self.running_state.update(
             (

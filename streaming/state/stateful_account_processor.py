@@ -22,6 +22,15 @@ from pyspark.sql.types import (
     TimestampType,
 )
 
+from streaming.state._processor_batch import (
+    combine_event_frames,
+    directional_amounts,
+    consecutive_gap_delta,
+    event_time_bounds,
+    hourly_counts,
+    sum_numeric_column,
+)
+
 from preprocessing.spark_static_pipeline import (
     ACCOUNT_FEATURE_COLUMNS,
 )
@@ -178,14 +187,7 @@ def numeric_sum(events: pd.DataFrame, column_name: str) -> float:
     if column_name not in events.columns:
         return 0.0
 
-    return float(
-        pd.to_numeric(
-            events[column_name],
-            errors="coerce",
-        )
-        .fillna(0.0)
-        .sum()
-    )
+    return sum_numeric_column(events, column_name)
 
 
 def string_values(
@@ -247,22 +249,9 @@ class AccountRunningTotalsProcessor(StatefulProcessor):
     ) -> Iterator[pd.DataFrame]:
         del timer_values
 
-        batch_frames = list(rows)
-
-        if not batch_frames:
+        events = combine_event_frames(rows)
+        if events is None:
             return
-
-        events = pd.concat(
-            batch_frames,
-            ignore_index=True,
-        ).sort_values(
-            [
-                "event_time",
-                "direction",
-                "counterparty_account_id",
-            ],
-            kind="stable",
-        )
 
         if self.running_state.exists():
             previous_state = self.running_state.get()
@@ -324,15 +313,9 @@ class AccountRunningTotalsProcessor(StatefulProcessor):
             events["direction"] == "incoming"
         ]
 
-        outgoing_amounts = pd.to_numeric(
-            outgoing_events["amount"],
-            errors="coerce",
-        ).fillna(0.0)
-
-        incoming_amounts = pd.to_numeric(
-            incoming_events["amount"],
-            errors="coerce",
-        ).fillna(0.0)
+        outgoing_amounts, incoming_amounts = directional_amounts(
+            events, ["event_time","direction","counterparty_account_id"],
+        )
 
         outgoing_txn_count += len(outgoing_events)
         incoming_txn_count += len(incoming_events)
@@ -385,8 +368,7 @@ class AccountRunningTotalsProcessor(StatefulProcessor):
             string_values(events, "counterparty_bank_id")
         )
 
-        batch_first_event_time = events["event_time"].min()
-        batch_last_event_time = events["event_time"].max()
+        batch_first_event_time, batch_last_event_time = event_time_bounds(events)
 
         if (
             last_ordered_event_time is not None
@@ -397,22 +379,16 @@ class AccountRunningTotalsProcessor(StatefulProcessor):
                 "event-time input."
             )
 
-        for event_time in events["event_time"].tolist():
-            event_timestamp = pd.Timestamp(event_time)
+        for bucket, count in hourly_counts(events).items():
+            hourly_event_counts[bucket] = hourly_event_counts.get(bucket, 0) + count
 
-            current_hour_key = hour_key(event_timestamp)
-            hourly_event_counts[current_hour_key] = (
-                hourly_event_counts.get(current_hour_key, 0) + 1
-            )
-
-            if last_ordered_event_time is not None:
-                inter_txn_gap_hours_sum += (
-                    event_timestamp
-                    - pd.Timestamp(last_ordered_event_time)
-                ).total_seconds() / 3600.0
-                inter_txn_gap_count += 1
-
-            last_ordered_event_time = event_timestamp
+        gap_sum, gap_count = consecutive_gap_delta(
+            batch_first_event_time, batch_last_event_time,
+            len(events), last_ordered_event_time,
+        )
+        inter_txn_gap_hours_sum += gap_sum
+        inter_txn_gap_count += gap_count
+        last_ordered_event_time = batch_last_event_time
 
         if (
             first_event_time is None

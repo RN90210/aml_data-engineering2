@@ -166,26 +166,29 @@ def main() -> None:
         valid_account_events
     )
 
-    query = (
-        account_edge_updates.writeStream
-        .outputMode("update")
-        .foreachBatch(
-            lambda batch_updates, batch_id: write_account_edge_batch(
-                account_edge_updates=batch_updates,
-                batch_id=batch_id,
-                output_dir=args.output_dir,
-                run_id=args.run_id,
+    try:
+        query = (
+            account_edge_updates.writeStream
+            .outputMode("update")
+            .foreachBatch(
+                lambda batch_updates, batch_id: write_account_edge_batch(
+                    account_edge_updates=batch_updates,
+                    batch_id=batch_id,
+                    output_dir=args.output_dir,
+                    run_id=args.run_id,
+                )
             )
+            .option(
+                "checkpointLocation",
+                str(args.checkpoint_dir),
+            )
+            .trigger(availableNow=True)
+            .start()
         )
-        .option(
-            "checkpointLocation",
-            str(args.checkpoint_dir),
-        )
-        .trigger(availableNow=True)
-        .start()
-    )
 
-    query.awaitTermination()
+        query.awaitTermination()
+    finally:
+        entity_lookup.unpersist()
 
     print("Stateful Account-to-Account edge run complete.")
     print(f"Output directory: {args.output_dir / f'run_id={args.run_id}'}")

@@ -123,7 +123,7 @@ def add_input_row_offsets(
 ) -> DataFrame:
     """Assign Kafka-like offsets from the replay DataFrame's input-row order."""
     indexed_schema = StructType(
-        list(TRANSACTION_SCHEMA.fields)
+        list(replay_rows.schema.fields)
         + [StructField("_input_row_offset", LongType(), nullable=False)]
     )
     indexed_rows = replay_rows.rdd.zipWithIndex().map(
@@ -143,10 +143,9 @@ def build_replay_account_events(
     """Build valid Account events and return the original replay offsets."""
     replay_rows = (
         spark.read
-        .option("header", "false")
+        .option("header", "true")
         .schema(TRANSACTION_SCHEMA)
         .csv(str(replay_path))
-        .filter(F.col("Timestamp") != "Timestamp")
     )
     indexed_rows = add_input_row_offsets(spark, replay_rows)
     replay_offsets = indexed_rows.select(
@@ -353,6 +352,14 @@ def validate_replay(args: argparse.Namespace) -> bool:
             current_events = cumulative_events.filter(
                 F.col("kafka_offset") >= F.lit(first_offset)
             )
+            # The shared pipeline publishes no model package when every event
+            # in this Kafka batch was rejected. Verify that case from the replay
+            # itself, rather than assuming an absent package means success.
+            batch_directory = run_directory / f"batch_id={batch_id}"
+            if not batch_directory.exists() and not has_rows(current_events):
+                for table_name in TABLE_KEYS:
+                    print(f"batch={batch_id} table={table_name} PASS (no valid events; no package)")
+                continue
             expected_tables = expected_tables_for_batch(
                 cumulative_events,
                 current_events,
@@ -389,6 +396,8 @@ def validate_replay(args: argparse.Namespace) -> bool:
     finally:
         if "valid_events" in locals():
             valid_events.unpersist()
+        if "entity_lookup" in locals():
+            entity_lookup.unpersist()
         spark.stop()
 
     print(f"overall={'PASS' if overall_passed else 'FAIL'}")

@@ -195,6 +195,7 @@ def main() -> None:
         query.awaitTermination()
     finally:
         cached_bank_account_counts.unpersist()
+        entity_lookup.unpersist()
 
     print("Stateful Bank feature run complete.")
     print(f"Output directory: {args.output_dir / f'run_id={args.run_id}'}")

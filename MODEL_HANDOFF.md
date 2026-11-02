@@ -4,7 +4,7 @@ The data pipeline supplies graph features for model training and inference. It d
 
 ## Replay size and timing
 
-The current Airflow demonstration publishes 1,000 post-cutoff transactions to a run-specific Kafka topic. Each transaction produces one outgoing and one incoming Account event. All five native output pipelines and the independent audit read the same topic with `maxOffsetsPerTrigger=500`, so the clean demonstration produces two batches of 500 transactions and 1,000 Account events each. These are demonstration limits, not a production throughput guarantee. Invalid transactions contribute two rejected Account events and no feature updates.
+The current Airflow demonstration publishes 1,000 post-cutoff transactions to a run-specific Kafka topic. Each transaction produces one outgoing and one incoming Account event. The default shared application reads Kafka once with `maxOffsetsPerTrigger=500`, prepares the events once, and feeds the native processors from durable prepared batches. The clean demonstration produces two batches of 500 transactions and 1,000 Account events each. The legacy standalone pipelines remain available via `pipeline_mode: legacy`. These are demonstration limits, not a production throughput guarantee. Invalid transactions contribute two rejected Account events and no feature updates.
 
 The historical static baseline uses transactions before `2022/09/01 00:30`. The replay window starts at that timestamp. Training and evaluation must preserve this time boundary: features available at a prediction time cannot include later transactions.
 
@@ -25,7 +25,15 @@ The exact feature names and column order are defined by `ACCOUNT_FEATURE_COLUMNS
 
 Each batch contains only affected nodes, edges, and mappings. Feature values on those rows include valid transactions from the beginning of this replay through that batch. Apply batches in increasing `batch_id` order, upserting by the keys above. Do not replace the whole graph with one batch's rows, or sum feature rows across batches. Temporal features are calculated as of each batch. Start from the static graph baseline if inference requires historical context; the incremental packages alone are not a complete graph snapshot.
 
-`manifest.json` marks a completed six-table batch as `ready` and records its row counts and columns. The audit writes per-batch Kafka offset ranges, accepted/rejected event counts, and validation status. The run report summarizes audit and package readiness. Consumers should only apply ready packages for a run whose final report passes their rejection policy.
+`manifest.json` marks a completed six-table batch as `ready` and records its row counts and columns. The audit writes per-batch Kafka offset ranges, accepted/rejected event counts, and validation status. Live batch consumers may apply a ready package after its matching audit passes their rejection policy; they do not need to wait for the final report. The run report summarizes the completed run. Offline training/evaluation can additionally require that final report and independent feature comparison before accepting the entire run.
+
+The shared ingestion runner prepares each Kafka batch once in one Spark application
+and publishes its manifest before preparing the next batch. The legacy standalone
+pipelines remain available. See [SHARED_PIPELINE.md](SHARED_PIPELINE.md) for the
+shared command, checkpoint requirements, and `model_update_feed.ready_batches`
+consumer interface. The feed returns package paths in batch order and explicitly
+identifies rejected-only batches. The model owns its durable last-applied cursor;
+feature rows must be upserted, never added to previous feature values.
 
 ## Model-side decisions to agree on
 

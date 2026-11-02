@@ -63,8 +63,13 @@ def write_audit_batch(
     rejected_output_dir: Path,
     metrics_output_dir: Path,
     totals: dict,
+    release_input: bool = True,
 ) -> None:
-    """Validate, retain rejections, and record metrics for one batch."""
+    """Validate, retain rejections, and record metrics for one batch.
+
+    A shared stateless-input owner may retain the input cache for another write
+    using release_input=False; it must unpersist that input in its own finally.
+    """
     started = time.perf_counter()
     batch_events = batch_events.persist(StorageLevel.MEMORY_AND_DISK)
     valid_events = None
@@ -172,7 +177,8 @@ def write_audit_batch(
             valid_events.unpersist()
         if rejected_events is not None:
             rejected_events.unpersist()
-        batch_events.unpersist()
+        if release_input:
+            batch_events.unpersist()
 
 
 def print_final_summary(totals: dict) -> None:
@@ -291,28 +297,31 @@ def main() -> None:
         "validation_passed": True,
     }
 
-    query = (
-        account_events.writeStream
-        .outputMode("append")
-        .foreachBatch(
-            lambda batch_events, batch_id: write_audit_batch(
-                batch_events=batch_events,
-                batch_id=batch_id,
-                run_id=args.run_id,
-                rejected_output_dir=args.rejected_output_dir,
-                metrics_output_dir=args.metrics_output_dir,
-                totals=totals,
+    try:
+        query = (
+            account_events.writeStream
+            .outputMode("append")
+            .foreachBatch(
+                lambda batch_events, batch_id: write_audit_batch(
+                    batch_events=batch_events,
+                    batch_id=batch_id,
+                    run_id=args.run_id,
+                    rejected_output_dir=args.rejected_output_dir,
+                    metrics_output_dir=args.metrics_output_dir,
+                    totals=totals,
+                )
             )
+            .option(
+                "checkpointLocation",
+                str(args.checkpoint_dir),
+            )
+            .trigger(availableNow=True)
+            .start()
         )
-        .option(
-            "checkpointLocation",
-            str(args.checkpoint_dir),
-        )
-        .trigger(availableNow=True)
-        .start()
-    )
 
-    query.awaitTermination()
+        query.awaitTermination()
+    finally:
+        entity_lookup.unpersist()
     print_final_summary(totals)
 
 
